@@ -14,7 +14,7 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
 
 from model import MNISTDiffusion
-from utils_data import create_mnist_dataloaders
+from utils_data import create_mnist_dataloaders,create_mnist_6_dataloaders
 from radon_transform import radonTransform
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.cuda.empty_cache()
@@ -23,20 +23,16 @@ image_size = 28
 train_dataloader, test_dataloader = create_mnist_dataloaders(batch_size=1, image_size=image_size)
 image, target = next(iter(test_dataloader))
 x = image[0,0,...].to(device)
-x = (x+1.0)/2.0
+# x = (x+1.0)/2.0
 
-angleNum = image_size
+angleNum = image_size // 2
 A = torch.tensor(radonTransform(angleNum, image_size, image_size).copy()).float().to(device)   # radon transform=the forward model of computed tomography
 # A = torch.eye(image_size**2).to(device)   # eye matrix=denoising
 y_noise_free = A @ x.reshape(-1, 1)
-sigma = 0.01 * torch.max(y_noise_free)
-y = y_noise_free + sigma * torch.randn(*y_noise_free.shape,device=device)
+sigma_y = 0.1 * torch.max(y_noise_free)
+y = y_noise_free + sigma_y * torch.randn(*y_noise_free.shape,device=device)
 
-x_fbp = torch.linalg.solve(A.T@A+0.01*torch.eye(A.shape[1]).to(device),A.T@y)
-x_fbp = x_fbp.reshape(image_size,image_size)
-psnr_fbp = psnr(x.cpu().numpy(),x_fbp.cpu().numpy())
-ssim_fbp = ssim(x.cpu().numpy(),x_fbp.cpu().numpy(),data_range=1)
-print(f"psnr_fbp: {psnr_fbp}, ssim_fbp: {ssim_fbp}")
+x_fbp = torch
 # ---Figure----
 sinogram_noise_free = y_noise_free.reshape(angleNum, A.shape[0] // angleNum) #.T
 sinogram = y.reshape(angleNum, A.shape[0] // angleNum) #.T
@@ -65,54 +61,128 @@ model = MNISTDiffusion(timesteps=timesteps,
                         base_dim=64,
                         dim_mults=[2, 4],
                         device=device).to(device)
-checkpoint = torch.load(f"results/steps_00046500.pt", map_location=device,weights_only=True)
+checkpoint = torch.load(f"results/mix_steps_00469000.pt", map_location=device,weights_only=True)
 model.load_state_dict(checkpoint["model"])
-
+model.eval()
 alphas = model.alphas
 alphas_cumprod = model.alphas_cumprod
 betas = model.betas
 #%%
+from sklearn.mixture import GaussianMixture
+
+def fit_gmm_from_mnist_six(n_samples=100, n_components=10):
+    from torchvision import datasets, transforms
+    transform = transforms.Compose([transforms.ToTensor()])
+    mnist = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    six_images = [img.numpy().flatten() for img, label in mnist if label == 6]
+    data = np.stack(six_images[:n_samples])
+    gmm = GaussianMixture(n_components=n_components, covariance_type='diag', random_state=0)
+    gmm.fit(data)
+    return gmm, data
+# === 预处理：训练 GMM 和计算 sigma ===
+gmm, data_for_sigma = fit_gmm_from_mnist_six(n_samples=100,n_components=4)
+sigma = np.std(data_for_sigma)
 N = timesteps
-for zeta in np.linspace(20,21,2):
+# zeta=4.6
+for _ in range(3):
+    mse_list = []
+    loglik_gauss_list = []
+    loglik_gmm_list = []
     x_rec = torch.randn_like(image).to(device).requires_grad_(True)
     for name,para in model.model.named_parameters():
         para.requires_grad_(False)
 
     for i in tqdm(range(N-1,0,-1)):
         # line 4 of Algorithm 1: compute E[x_0|x_i]
-        pred = model.model(2*x_rec-1, torch.tensor([i], device=device, dtype=torch.long))
-        s_hat = -pred/(1-alphas_cumprod[i])**0.5  # Tweedie's formula
-        
+        pred = model.model(x_rec, torch.tensor([i], device=device, dtype=torch.long))
+        s_hat = -pred/(1-alphas_cumprod[i])**0.5
+
         reverse_std = betas[i] * (1.0 - alphas_cumprod[i-1]) / (1.0 - alphas_cumprod[i])
+        # reverse_std = torch.sqrt(reverse_std)
         x0_hat = (x_rec + (1-alphas_cumprod[i])*s_hat) / torch.sqrt(alphas_cumprod[i])
         x0_hat = torch.clamp(x0_hat, -1.0, 1.0)
 
+        # x0_hat_scaled = (x0_hat + 1.0) / 2.0  # 缩放到 [0,1] 区间
+
+        mse = torch.nn.functional.mse_loss(x0_hat, x.unsqueeze(0).unsqueeze(0)).item()
+        mse_list.append(mse)
+        # 缩放 x0_hat 到 [0,1]
+        # x0_hat_scaled = (x0_hat + 1.0) / 2.0
+        x0_hat_vec = x0_hat.detach().cpu().numpy().reshape(-1)  # shape: (784,)
+        x_vec = x.detach().cpu().numpy().reshape(-1)  # true x
+
+        # 模型A：log-likelihood under N(x0_hat, sigma^2 I)
+        d = len(x_vec)
+        var = sigma ** 2
+        loglik_gauss = -0.5 * d * np.log(2 * np.pi * var) - 0.5 * np.sum((x0_hat_vec) ** 2) / var
+        loglik_gauss_list.append(loglik_gauss)
+
+        # 模型B：log-likelihood under GMM, evaluated at x0_hat
+        loglik_gmm = gmm.score_samples(x0_hat_vec.reshape(1, -1))[0]  # 单个样本
+        loglik_gmm_list.append(loglik_gmm)
         # line 6 of Algorithm 1: compute p(x_{i-1}|x_i, x_0)
         z = torch.randn_like(x_rec, device=device)
-      
-        x_iminus1 = (torch.sqrt(alphas[i])*(1-alphas_cumprod[i-1])/(1-alphas_cumprod[i])*x_rec + 
-                     torch.sqrt(alphas_cumprod[i-1])*betas[i]/(1-alphas_cumprod[i])*x0_hat + 
+
+        x_iminus1 = (torch.sqrt(alphas[i])*(1-alphas_cumprod[i-1])/(1-alphas_cumprod[i])*x_rec +
+                     torch.sqrt(alphas_cumprod[i-1])*betas[i]/(1-alphas_cumprod[i])*x0_hat +
                      reverse_std*z)
 
         # line 7 of Algorithm 1: update x with gradient scaling
         norm = torch.linalg.norm(y - A@x0_hat.reshape(-1,1))
         norm_grad = torch.autograd.grad(norm, x_rec)[0]
-        
+
         # Adaptive gradient scaling
         grad_norm = torch.norm(norm_grad)
         if grad_norm > 1.0:
             norm_grad = norm_grad / grad_norm
-            
-        zeta_i = zeta / (norm.item() + 1e-6)  # Add small epsilon to prevent division by zero
-        x_rec = x_iminus1 - zeta_i * norm_grad
+
+        # zeta_i = zeta / (norm.item() + 1e-6)  # Add small epsilon to prevent division by zero
+        x_rec = x_iminus1 - torch.sqrt(alphas_cumprod[i]) * norm_grad
 
         # Early stopping check
         if norm.item() < 1e-4:
             print(f"Early stopping at step {i}")
             break
-
+        x_rec = torch.clamp(x_rec, -1.0, 1.0)
         x_rec = x_rec.detach().requires_grad_(True)
-    #%% results
+        #%% results
+    # 横轴 t 从 1 到 N-1，纵轴是 MSE
+    mse_list = mse_list[::-1]
+    t_values = list(range(1, len(mse_list) + 1))
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(t_values, mse_list, label=f'sigma_y={sigma_y:.3f}')
+    plt.xlabel("Timestep t")
+    plt.ylabel("MSE(x0_hat, x_true)")
+    plt.title("MSE between x0_hat and x_true vs t")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    t_values = list(range(1, len(loglik_gauss_list) + 1))
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(t_values, loglik_gauss_list, label='Gaussian (μ=x0_hat)')
+    plt.xlabel('Timestep t')
+    plt.ylabel('Log-likelihood')
+    plt.title('Log-likelihood of x given x0_hat (Gaussian)')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(t_values, loglik_gmm_list, label='GMM (x0_hat)', color='orange')
+    plt.xlabel('Timestep t')
+    plt.ylabel('Log-likelihood')
+    plt.title('Log-likelihood of x0_hat under GMM')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
     x_img = x.cpu().numpy()
     x0_img = x_rec.detach().cpu().numpy().squeeze(0).squeeze(0)
     # x0_img = (x0_img+1.0)/2.0
@@ -120,14 +190,14 @@ for zeta in np.linspace(20,21,2):
     x0_hat_img = (x0_hat_img+1.0)/2.0
     print("psnr:",psnr(x_img,x0_img))
     print("ssim:",ssim(x_img,x0_img,data_range=1))
-# ---Figure----
+    # ---Figure----
     fig, axes = plt.subplots(3, 1, figsize=(4, 14))
     im1 = axes[0].imshow(x_img)
     axes[0].set_title(f'ground truth', fontsize=13)
     cbar1 = fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
-    
+
     im2 = axes[1].imshow(x0_img)
-    axes[1].set_title(f'x0 \n zeta:{zeta:3f} \n psnr:{psnr(x_img,x0_img):3f} \n ssim:{ssim(x_img,x0_img,data_range=1):3f} ',fontsize=13)
+    axes[1].set_title(f'x0\n psnr:{psnr(x_img,x0_img):3f} \n ssim:{ssim(x_img,x0_img,data_range=1):3f} ',fontsize=13)
     cbar2 = fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
 
     im3 = axes[2].imshow(x0_hat_img)
