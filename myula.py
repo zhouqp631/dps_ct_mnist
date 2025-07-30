@@ -84,7 +84,7 @@ def chambolle_prox_TV(g1, device, varargin, img_size):
 
         # defaults for optional parameters
         tau = 0.249
-        tol = 1e-4
+        tol = 1e-3
         lambd = 1
         maxiter = 20
         verbose = 0
@@ -190,12 +190,15 @@ def myula_sampling(lambd,  step_size,  x,y, A,  sigma, num_samples,img_true, img
     psnr_values = []
     x_samples = []
     A_T = A.T
-    for i in range(num_samples):
-        gradf = A_T @ (y-A@x) / sigma ** 2
-        proxg = chambolle_prox_TV(x)  # 近似
-        gradg = (proxg - x) / lambd
-        x = x + step_size * (gradf + gradg) + torch.sqrt(2 * step_size) * torch.randn_like(x)
-        x_samples.append(x)
+    x_rec = x.reshape(-1,1)
+    img_true = img_true.cpu().numpy()
+    for i in tqdm(range(num_samples)):
+        gradf = A_T @ (y-A@x_rec) / sigma ** 2
+        proxg = chambolle_prox_TV(x_rec,device,{'lambda':lambd, 'Maxiter':25},img_size)  # 近似
+        gradg = (proxg - x_rec) / lambd
+        x_rec = x_rec + step_size * (gradf + gradg) + torch.sqrt(torch.tensor(2 * step_size)) * torch.randn_like(x_rec)
+        x_rec = torch.clamp(x_rec, -1, 1)
+        x_samples.append(x_rec)
         x_samples_array = np.array([x.cpu().numpy() for x in x_samples])
         x_mean = np.mean(x_samples_array, axis=0)
         # 计算当前x的PSNR值并记录下来
@@ -207,10 +210,17 @@ def myula_sampling(lambd,  step_size,  x,y, A,  sigma, num_samples,img_true, img
         #     z0 = z1
         # else:
         #     z0 = z0
-    return x_samples_array, psnr_values,x
+    return x_samples_array, psnr_values,x_rec
 
+x_noise = x + sigma_y*torch.randn(*x.shape, device=device)
+lambd = 0.1
+step_size = 1e-6
+num_samples = 500
+theta = 1
+x_array, psnr_list,x_rec = myula_sampling(lambd, step_size, x_noise, y ,A,sigma_y,num_samples,x,image_size)
+x_noise = x_noise.cpu().numpy()
 x_img = x.cpu().numpy()
-x0_img = x_rec.detach().cpu().numpy().squeeze(0).squeeze(0)
+x0_img = x_rec.detach().cpu().numpy().reshape(image_size, image_size)
 # x0_img = (x0_img+1.0)/2.0
 # x0_hat_img = x0_hat.detach().cpu().numpy().squeeze(0).squeeze(0)
 # x0_hat_img = (x0_hat_img+1.0)/2.0
@@ -225,3 +235,17 @@ cbar1 = fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
 im2 = axes[1].imshow(x0_img)
 axes[1].set_title(f'x0\n psnr:{psnr(x_img,x0_img):3f} \n ssim:{ssim(x_img,x0_img,data_range=1):3f} ',fontsize=13)
 cbar2 = fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+
+im3 = axes[2].imshow(x_noise)
+axes[2].set_title(f'x0_hat\n psnr:{psnr(x_img,x_noise):3f} \n ssim:{ssim(x_img,x_noise,data_range=1):3f} ',fontsize=13)
+cbar3 = fig.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+fig.tight_layout()
+plt.show()
+
+plt.figure(figsize=(10, 6))
+plt.plot(psnr_list)
+plt.title(f'psnr_values')
+plt.xlabel(f'Iterations')
+plt.ylabel(f'PSNR')
+plt.grid(True)
+plt.show()
