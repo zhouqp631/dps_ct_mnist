@@ -3,6 +3,7 @@ ref: https://github.com/LTH14/JiT/blob/main/denoiser.py
 """
 import torch
 import torch.nn as nn
+from matplotlib import pyplot as plt
 from torchvision.utils import save_image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
@@ -24,7 +25,7 @@ def parse_args():
     parser.add_argument('--timesteps', type=int, help='sampling steps of DDPM', default=1000)
     parser.add_argument('--P_mean', type=float, help='mean of P', default=-0.8)
     parser.add_argument('--P_std', type=float, help='std of P', default=0.8)
-    parser.add_argument('--log_freq', type=int, help='training log message printing frequence', default=50)
+    parser.add_argument('--log_freq', type=int, help='training log message printing frequence', default=5)
     args = parser.parse_args()
     return args
 
@@ -51,6 +52,7 @@ def main(args):
         print("Load checkpoint from {}".format(args.ckpt))
 
     global_steps = 0
+    losses = []
     for i in range(args.epochs):
         model.train()
         for j, (image, target) in enumerate(train_dataloader):
@@ -63,15 +65,23 @@ def main(args):
             scheduler.step()
 
             global_steps += 1
-            if j % args.log_freq == 0:
-                print("Epoch[{}/{}],Step[{}/{}],loss:{:.5f},lr:{:.5f}".format(i + 1, args.epochs, j, len(train_dataloader),loss.detach().cpu().item(),scheduler.get_last_lr()[0]))
+            losses.append(loss.detach().cpu().item())
+        if i % args.log_freq == 0:
+            print("Epoch[{}/{}],Step[{}/{}],loss:{:.5f},lr:{:.5f}".format(i + 1, args.epochs, j, len(train_dataloader),loss.detach().cpu().item(),scheduler.get_last_lr()[0]))
         ckpt = {"model": model.state_dict()}
         os.makedirs("results", exist_ok=True)
-        torch.save(ckpt, "results/FM_steps_{:0>8}.pt".format(global_steps))
+        torch.save(ckpt, "results/FM_x_pred_steps_{:0>8}.pt".format(global_steps))
 
         model.eval()
         samples = model.generate(args.n_samples)
-        save_image(samples, "results/FM_steps_{:0>8}.png".format(global_steps), nrow=int(math.sqrt(args.n_samples)))
+        save_image(samples, "results/FM_x_pred_steps_{:0>8}.png".format(global_steps), nrow=int(math.sqrt(args.n_samples)))
+
+        plt.figure()
+        plt.plot(losses)
+        plt.xlabel("Steps")
+        plt.ylabel("Loss")
+        plt.savefig("results/FM_x_pred_loss_curve.png")
+        plt.close()
 
 if __name__ == "__main__":
     args = parse_args()
