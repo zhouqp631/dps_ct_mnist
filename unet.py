@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import math
 
 class ChannelShuffle(nn.Module):
     def __init__(self, groups):
@@ -34,8 +34,7 @@ class ResidualBottleneck(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
 
-        self.branch1 = nn.Sequential(nn.Conv2d(in_channels // 2, in_channels // 2, 3, 1, 1, groups=in_channels // 2),
-                                     nn.BatchNorm2d(in_channels // 2),
+        self.branch1 = nn.Sequential(nn.Conv2d(in_channels // 2, in_channels // 2, 3, 1, 1, groups=in_channels // 2),nn.BatchNorm2d(in_channels // 2),
                                      ConvBnSiLu(in_channels // 2, out_channels // 2, 1, 1, 0))
         self.branch2 = nn.Sequential(ConvBnSiLu(in_channels // 2, in_channels // 2, 1, 1, 0),
                                      nn.Conv2d(in_channels // 2, in_channels // 2, 3, 1, 1, groups=in_channels // 2),
@@ -89,7 +88,6 @@ class TimeMLP(nn.Module):
     def forward(self, x, t):
         t_emb = self.mlp(t).unsqueeze(-1).unsqueeze(-1)
         x = x + t_emb
-
         return self.act(x)
 
 
@@ -131,6 +129,47 @@ class DecoderBlock(nn.Module):
 
         return x
 
+class TimestepEmbedder(nn.Module):
+    """
+    ref: https://github.com/LTH14/JiT/blob/main/model_jit.py#L237
+
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
 
 class Unet(nn.Module):
     '''
@@ -145,7 +184,7 @@ class Unet(nn.Module):
         channels = self._cal_channels(base_dim, dim_mults)
 
         self.init_conv = ConvBnSiLu(in_channels, base_dim, 3, 1, 1)
-        self.time_embedding = nn.Embedding(timesteps, time_embedding_dim)
+        self.time_embedding = TimestepEmbedder(time_embedding_dim)
 
         self.encoder_blocks = nn.ModuleList([EncoderBlock(c[0], c[1], time_embedding_dim) for c in channels])
         self.decoder_blocks = nn.ModuleList([DecoderBlock(c[1], c[0], time_embedding_dim) for c in channels[::-1]])
@@ -156,6 +195,10 @@ class Unet(nn.Module):
         self.final_conv = nn.Conv2d(in_channels=channels[0][0] // 2, out_channels=out_channels, kernel_size=1)
 
     def forward(self, x, t=None):
+        """
+        x: NCHW    (64,1,28,28)
+        t: [N]     [64]
+        """
         x = self.init_conv(x)
         if t is not None:
             t = self.time_embedding(t)
@@ -183,6 +226,6 @@ class Unet(nn.Module):
 if __name__ == "__main__":
     x = torch.randn(3, 1, 28, 28)
     t = torch.randint(0, 1000, (3,))
-    model = Unet(1000, 128)
+    model = Unet(1000, 256, dim_mults=[2,4])
     y = model(x, t)
     print(y.shape)
